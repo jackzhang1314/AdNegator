@@ -4,7 +4,7 @@ import { useState, useRef, useEffect } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+
 import { Badge } from '@/components/ui/badge'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Label } from '@/components/ui/label'
@@ -78,7 +78,6 @@ export default function AnalysisPage() {
   const [fileName, setFileName] = useState<string>('')
   const [error, setError] = useState<string>('')
   const [rawData, setRawData] = useState<RawDataRow[]>([])
-  const [parsedData, setParsedData] = useState<ParsedDataRow[]>([])
   const [availableColumns, setAvailableColumns] = useState<string[]>([])
   const [columnMapping, setColumnMapping] = useState<{[key: string]: string}>({})
   const [headerRowIndex, setHeaderRowIndex] = useState(3) // 默认第3行是表头（Google Ads搜索词报告的标准格式）
@@ -101,7 +100,7 @@ export default function AnalysisPage() {
   })
   const [analysisResults, setAnalysisResults] = useState<AnalysisResult[]>([])
   const [editableResults, setEditableResults] = useState<AnalysisResult[]>([])
-  const [analysisError, setAnalysisError] = useState<string | null>(null)
+
 
   // 监听hasHeader变化，重新解析数据
   useEffect(() => {
@@ -820,7 +819,7 @@ export default function AnalysisPage() {
                         <tbody>
                           {processDataWithMapping().slice(0, 100).map((row, index) => (
                             <tr key={index} className="border-b">
-                              {Object.entries(requiredFields).map(([field, label]) => (
+                              {Object.entries(requiredFields).map(([field, _label]) => (
                                 columnMapping[field] && (
                                   <td key={field} className="px-4 py-2 text-gray-700">
                                     {String(row[field as keyof ParsedDataRow])}
@@ -903,7 +902,7 @@ export default function AnalysisPage() {
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-gray-200">
-                          {analysisResults.map((result, index) => (
+                          {analysisResults.map((result, _index) => (
                             <tr key={result.id} className="hover:bg-gray-50">
                               <td className="px-4 py-3 text-sm font-medium text-gray-900">
                                 {result.searchTerm}
