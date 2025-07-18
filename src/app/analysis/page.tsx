@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, useCallback } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
@@ -101,39 +101,8 @@ export default function AnalysisPage() {
   const [analysisResults, setAnalysisResults] = useState<AnalysisResult[]>([])
   const [editableResults, setEditableResults] = useState<AnalysisResult[]>([])
 
-
-  // 监听hasHeader变化，重新解析数据
-  useEffect(() => {
-    if (rawFileContent) {
-      const parsed = parseCSV(rawFileContent)
-      setRawData(parsed)
-
-      if (parsed.length > 0 && parsed[0]) {
-        const columns = Object.keys(parsed[0]).filter(col => col && col.trim())
-        setAvailableColumns(columns)
-
-        // 清空之前的映射
-        setColumnMapping({})
-
-        // 延迟执行自动映射（如果开启）
-        if (autoMapping) {
-          setTimeout(() => {
-            autoMapFields()
-          }, 100)
-        }
-      }
-    }
-  }, [headerRowIndex])
-
-  // 监听自动映射开关变化
-  useEffect(() => {
-    if (autoMapping && availableColumns.length > 0) {
-      autoMapFields()
-    }
-  }, [autoMapping])
-
   // 解析CSV文件
-  const parseCSV = (text: string): RawDataRow[] => {
+  const parseCSV = useCallback((text: string): RawDataRow[] => {
     const allLines = text.split('\n').filter(line => line.trim())
     // 过滤掉注释行（以#开头的行）
     const lines = allLines.filter(line => !line.trim().startsWith('#'))
@@ -202,7 +171,74 @@ export default function AnalysisPage() {
       }
     }
     return data
-  }
+  }, [headerRowIndex])
+
+  // 自动映射字段
+  const autoMapFields = useCallback(() => {
+    const mapping: {[key: string]: string} = {}
+
+    // 常见的字段名映射（包含Google Ads特有字段）
+    const fieldMappings = {
+      searchTerm: ['搜索字词', '搜索词', 'search term', 'query', '查询词'],
+      keyword: ['关键字', '关键词', 'keyword', 'kw'],
+      campaign: ['推广计划', '广告系列', 'campaign', '计划'],
+      adGroup: ['广告组', 'ad group', 'adgroup', '单元'],
+      matchType: ['匹配类型', 'match type', '匹配方式'],
+      impressions: ['展现量', '展示次数', 'impressions', 'impr', '展现次数'],
+      clicks: ['点击次数', '点击量', 'clicks'],
+      cost: ['费用', '花费', 'cost', 'spend'],
+      conversions: ['转化次数', '转化量', 'conversions', 'conv'],
+      conversionValue: ['转化价值', '转化值', 'conversion value', 'conv value', '所有转化价值'],
+      ctr: ['点击率', 'ctr', 'click through rate'],
+      avgCpc: ['平均点击费用', '平均cpc', 'avg cpc', 'average cpc', '平均每次点击费用'],
+      conversionRate: ['转化率', 'conversion rate', 'conv rate']
+    }
+
+    Object.entries(fieldMappings).forEach(([field, possibleNames]) => {
+      for (const possibleName of possibleNames) {
+        const matchedColumn = availableColumns.find(col =>
+          col.toLowerCase().includes(possibleName.toLowerCase()) ||
+          possibleName.toLowerCase().includes(col.toLowerCase())
+        )
+        if (matchedColumn) {
+          mapping[field] = matchedColumn
+          break
+        }
+      }
+    })
+
+    setColumnMapping(mapping)
+  }, [availableColumns])
+
+  // 监听hasHeader变化，重新解析数据
+  useEffect(() => {
+    if (rawFileContent) {
+      const parsed = parseCSV(rawFileContent)
+      setRawData(parsed)
+
+      if (parsed.length > 0 && parsed[0]) {
+        const columns = Object.keys(parsed[0]).filter(col => col && col.trim())
+        setAvailableColumns(columns)
+
+        // 清空之前的映射
+        setColumnMapping({})
+
+        // 延迟执行自动映射（如果开启）
+        if (autoMapping) {
+          setTimeout(() => {
+            autoMapFields()
+          }, 100)
+        }
+      }
+    }
+  }, [headerRowIndex, autoMapFields, autoMapping, parseCSV, rawFileContent])
+
+  // 监听自动映射开关变化
+  useEffect(() => {
+    if (autoMapping && availableColumns.length > 0) {
+      autoMapFields()
+    }
+  }, [autoMapping, availableColumns.length, autoMapFields])
 
   // 字段映射配置
   const requiredFields = {
@@ -247,43 +283,6 @@ export default function AnalysisPage() {
     }
 
     return processed
-  }
-
-  // 自动映射字段
-  const autoMapFields = () => {
-    const mapping: {[key: string]: string} = {}
-
-    // 常见的字段名映射（包含Google Ads特有字段）
-    const fieldMappings = {
-      searchTerm: ['搜索字词', '搜索词', 'search term', 'query', '查询词'],
-      keyword: ['关键字', '关键词', 'keyword', 'kw'],
-      campaign: ['推广计划', '广告系列', 'campaign', '计划'],
-      adGroup: ['广告组', 'ad group', 'adgroup', '单元'],
-      matchType: ['匹配类型', 'match type', '匹配方式'],
-      impressions: ['展现量', '展示次数', 'impressions', 'impr', '展现次数'],
-      clicks: ['点击次数', '点击量', 'clicks'],
-      cost: ['费用', '花费', 'cost', 'spend'],
-      conversions: ['转化次数', '转化量', 'conversions', 'conv'],
-      conversionValue: ['转化价值', '转化值', 'conversion value', 'conv value', '所有转化价值'],
-      ctr: ['点击率', 'ctr', 'click through rate'],
-      avgCpc: ['平均点击费用', '平均cpc', 'avg cpc', 'average cpc', '平均每次点击费用'],
-      conversionRate: ['转化率', 'conversion rate', 'conv rate']
-    }
-
-    Object.entries(fieldMappings).forEach(([field, possibleNames]) => {
-      for (const possibleName of possibleNames) {
-        const matchedColumn = availableColumns.find(col =>
-          col.toLowerCase().includes(possibleName.toLowerCase()) ||
-          possibleName.toLowerCase().includes(col.toLowerCase())
-        )
-        if (matchedColumn) {
-          mapping[field] = matchedColumn
-          break
-        }
-      }
-    })
-
-    setColumnMapping(mapping)
   }
 
   // 处理文件上传
