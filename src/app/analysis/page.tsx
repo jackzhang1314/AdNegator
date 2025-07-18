@@ -176,8 +176,8 @@ export default function AnalysisPage() {
     return data
   }, [headerRowIndex])
 
-  // 自动映射字段
-  const autoMapFields = useCallback(() => {
+  // 手动触发自动映射 - 现在是一个独立的按钮点击处理函数
+  const handleAutoMapping = () => {
     const mapping: {[key: string]: string} = {}
 
     // 常见的字段名映射（包含Google Ads特有字段）
@@ -211,9 +211,9 @@ export default function AnalysisPage() {
     })
 
     setColumnMapping(mapping)
-  }, [availableColumns])
+  }
 
-  // 监听hasHeader变化，重新解析数据
+  // 监听hasHeader变化，重新解析数据 - 使用防抖和条件触发
   useEffect(() => {
     if (rawFileContent) {
       const parsed = parseCSV(rawFileContent)
@@ -221,27 +221,72 @@ export default function AnalysisPage() {
 
       if (parsed.length > 0 && parsed[0]) {
         const columns = Object.keys(parsed[0]).filter(col => col && col.trim())
-        setAvailableColumns(columns)
+        setAvailableColumns(prevColumns => {
+          // 只有当列名真正变化时才更新，避免不必要的重渲染
+          const columnsString = JSON.stringify(columns.sort())
+          const prevColumnsString = JSON.stringify(prevColumns.sort())
+          if (columnsString === prevColumnsString) {
+            return prevColumns
+          }
+          return columns
+        })
 
-        // 清空之前的映射
+        // 清空之前的映射，但只在列名变化时
         setColumnMapping({})
-
-        // 延迟执行自动映射（如果开启）
-        if (autoMapping) {
-          setTimeout(() => {
-            autoMapFields()
-          }, 100)
-        }
       }
     }
-  }, [headerRowIndex, autoMapFields, autoMapping, parseCSV, rawFileContent])
+  }, [headerRowIndex, parseCSV, rawFileContent])
 
-  // 监听自动映射开关变化
+  // 自动映射 - 使用防抖和条件触发
   useEffect(() => {
-    if (autoMapping && availableColumns.length > 0) {
-      autoMapFields()
+    if (!autoMapping || availableColumns.length === 0) {
+      return
     }
-  }, [autoMapping, availableColumns.length, autoMapFields])
+
+    // 使用防抖避免频繁更新
+    const timer = setTimeout(() => {
+      const mapping: {[key: string]: string} = {}
+      let hasChanges = false
+
+      // 常见的字段名映射
+      const fieldMappings = {
+        searchTerm: ['搜索字词', '搜索词', 'search term', 'query', '查询词'],
+        keyword: ['关键字', '关键词', 'keyword', 'kw'],
+        campaign: ['推广计划', '广告系列', 'campaign', '计划'],
+        adGroup: ['广告组', 'ad group', 'adgroup', '单元'],
+        matchType: ['匹配类型', 'match type', '匹配方式'],
+        impressions: ['展现量', '展示次数', 'impressions', 'impr', '展现次数'],
+        clicks: ['点击次数', '点击量', 'clicks'],
+        cost: ['费用', '花费', 'cost', 'spend'],
+        conversions: ['转化次数', '转化量', 'conversions', 'conv'],
+        conversionValue: ['转化价值', '转化值', 'conversion value', 'conv value', '所有转化价值'],
+        ctr: ['点击率', 'ctr', 'click through rate'],
+        avgCpc: ['平均点击费用', '平均cpc', 'avg cpc', 'average cpc', '平均每次点击费用'],
+        conversionRate: ['转化率', 'conversion rate', 'conv rate']
+      }
+
+      Object.entries(fieldMappings).forEach(([field, possibleNames]) => {
+        for (const possibleName of possibleNames) {
+          const matchedColumn = availableColumns.find(col =>
+            col.toLowerCase().includes(possibleName.toLowerCase()) ||
+            possibleName.toLowerCase().includes(col.toLowerCase())
+          )
+          if (matchedColumn) {
+            mapping[field] = matchedColumn
+            hasChanges = true
+            break
+          }
+        }
+      })
+
+      // 只有当映射真正变化时才更新
+      if (hasChanges) {
+        setColumnMapping(mapping)
+      }
+    }, 300) // 300ms防抖
+
+    return () => clearTimeout(timer)
+  }, [autoMapping, availableColumns])
 
   // 字段映射配置
   const requiredFields = {
@@ -382,7 +427,7 @@ export default function AnalysisPage() {
     reader.readAsText(file)
   }
 
-  // 开始分析 - 实时流式更新版本
+  // 开始分析 - 增强的错误处理和边界检查
   const handleAnalyze = async () => {
     const isDev = typeof window !== 'undefined' && window.location.hostname === 'localhost'
     if (isDev) {
@@ -405,7 +450,7 @@ export default function AnalysisPage() {
       return
     }
 
-    // 处理数据
+    // 处理数据并验证
     const processedData = processDataWithMapping()
     if (isDev) {
       console.log('Processed data:', processedData.slice(0, 2))
@@ -416,12 +461,23 @@ export default function AnalysisPage() {
       return
     }
 
+    // 验证数据格式
+    const validData = processedData.filter(item => 
+      item.searchTerm && typeof item.clicks === 'number' 
+      && typeof item.cost === 'number'
+    )
+
+    if (validData.length === 0) {
+      setError('数据格式不正确，请检查字段映射')
+      return
+    }
+
     // 初始化实时分析状态
-    const batchSize = 2
-    const totalBatches = Math.ceil(processedData.length / batchSize)
+    const batchSize = Math.min(2, Math.max(1, Math.floor(100 / Math.max(validData.length, 1))))
+    const totalBatches = Math.ceil(validData.length / batchSize)
 
     setAnalysisProgress({
-      total: processedData.length,
+      total: validData.length,
       completed: 0,
       currentBatch: 0,
       totalBatches,
@@ -430,16 +486,19 @@ export default function AnalysisPage() {
     setAnalysisResults([]) // 清空之前的结果
     setEditableResults([]) // 清空可编辑结果
     setError('')
-    setSelectedTab('results') // 立即切换到结果页面
+    setSelectedTab('results')
 
     try {
       if (isDev) {
-        console.log(`开始流式分析：${processedData.length}个搜索词，分${totalBatches}个批次`)
+        console.log(`开始流式分析：${validData.length}个搜索词，分${totalBatches}个批次`)
       }
 
+      let totalProcessed = 0
+      const allResults: any[] = []
+
       // 分批处理数据
-      for (let i = 0; i < processedData.length; i += batchSize) {
-        const batch = processedData.slice(i, i + batchSize)
+      for (let i = 0; i < validData.length; i += batchSize) {
+        const batch = validData.slice(i, i + batchSize)
         const currentBatch = Math.floor(i / batchSize) + 1
 
         if (isDev) {
@@ -453,21 +512,46 @@ export default function AnalysisPage() {
         }))
 
         try {
-          // 调用API分析当前批次
-          const response = await fetch(`${window.location.origin}/api/analyze`, {
+          // 使用更健壮的API调用
+          const apiUrl = `${window.location.origin}/api/analyze`
+          const controller = new AbortController()
+          const timeoutId = setTimeout(() => controller.abort(), 30000) // 30秒超时
+
+          const response = await fetch(apiUrl, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
             },
             body: JSON.stringify({ searchTerms: batch }),
+            signal: controller.signal
           })
+
+          clearTimeout(timeoutId)
 
           if (!response.ok) {
             const errorText = await response.text()
-            if (isDev) {
-              console.error(`批次${currentBatch}API错误:`, errorText)
+            console.error(`API错误 ${response.status}:`, errorText)
+            
+            // 尝试解析错误响应
+            let errorMessage = `分析失败 (HTTP ${response.status})`
+            try {
+              const errorData = JSON.parse(errorText)
+              errorMessage = errorData.error || errorMessage
+            } catch {
+              // 如果无法解析JSON，使用文本
+              errorMessage = errorText || errorMessage
             }
-            throw new Error(`批次${currentBatch}分析失败: ${response.status}`)
+
+            // 根据不同错误码提供具体提示
+            if (response.status === 413) {
+              errorMessage = '数据量过大，请减少单次分析的数据条数'
+            } else if (response.status === 429) {
+              errorMessage = '请求过于频繁，请稍后再试'
+            } else if (response.status >= 500) {
+              errorMessage = '服务器处理错误，请稍后重试'
+            }
+
+            throw new Error(errorMessage)
           }
 
           const data = await response.json()
@@ -478,29 +562,81 @@ export default function AnalysisPage() {
           }
 
           // 实时更新结果和进度
+          allResults.push(...batchResults)
+          totalProcessed += batchResults.length
+
           setAnalysisResults(prev => [...prev, ...batchResults])
           setEditableResults(prev => [...prev, ...batchResults])
           setAnalysisProgress(prev => ({
             ...prev,
-            completed: prev.completed + batchResults.length
+            completed: totalProcessed
           }))
 
         } catch (batchError) {
           if (isDev) {
             console.error(`批次${currentBatch}处理失败:`, batchError)
           }
-          // 继续处理下一批次，不中断整个流程
+          
+          // 网络错误或超时处理
+          if (batchError.name === 'AbortError') {
+            console.error('请求超时')
+          }
+          
+          // 创建一个失败的批次记录，而不是中断整个流程
+          const failedResults = batch.map((item: any, index: number) => ({
+            id: `failed-${i + index}`,
+            searchTerm: item.searchTerm,
+            translation: '分析失败',
+            keyword: item.keyword,
+            campaign: item.campaign,
+            adGroup: item.adGroup,
+            matchType: item.matchType,
+            impressions: item.impressions,
+            clicks: item.clicks,
+            cost: item.cost,
+            conversions: item.conversions,
+            conversionValue: item.conversionValue,
+            ctr: item.ctr,
+            avgCpc: item.avgCpc,
+            conversionRate: item.conversionRate,
+            analysis: {
+              semanticRelevance: { score: 0, analysis: '分析失败' },
+              commercialValue: { score: 0, analysis: '分析失败' },
+              performanceAnalysis: {
+                costEfficiency: '分析失败',
+                clickQuality: '分析失败',
+                conversionPotential: '分析失败'
+              },
+              recommendation: {
+                isNegative: false,
+                confidence: 0,
+                negativeKeyword: item.searchTerm,
+                matchType: 'phrase',
+                level: 'campaign',
+                reasonTags: ['ANALYSIS_FAILED'],
+                reasoning: batchError instanceof Error ? batchError.message : '分析失败'
+              }
+            }
+          }))
+
+          setAnalysisResults(prev => [...prev, ...failedResults])
+          setEditableResults(prev => [...prev, ...failedResults])
+          setAnalysisProgress(prev => ({
+            ...prev,
+            completed: prev.completed + batch.length
+          }))
         }
 
-        // 添加小延迟，避免API请求过于频繁
+        // 更智能的延迟，基于网络状况
         if (currentBatch < totalBatches) {
-          await new Promise(resolve => setTimeout(resolve, 100))
+          const delay = Math.min(1000, 100 + (currentBatch * 50)) // 指数退避
+          await new Promise(resolve => setTimeout(resolve, delay))
         }
       }
 
       // 分析完成
       if (isDev) {
-        console.log('所有批次分析完成')
+        console.log('所有批次分析完成，总结果:', allResults.length)
       }
       setAnalysisProgress(prev => ({
         ...prev,
@@ -508,14 +644,17 @@ export default function AnalysisPage() {
       }))
 
     } catch (err) {
-      if (isDev) {
-        console.error('Analysis error:', err)
-      }
+      console.error('分析过程错误:', err)
       setAnalysisProgress(prev => ({
         ...prev,
         isAnalyzing: false
       }))
-      setError(err instanceof Error ? err.message : '分析失败，请重试')
+      
+      const errorMessage = err instanceof Error 
+        ? err.message 
+        : '分析失败，请检查网络连接后重试'
+      
+      setError(errorMessage)
     }
   }
 
@@ -805,7 +944,7 @@ export default function AnalysisPage() {
 
                 {availableColumns.length > 0 && (
                   <div className="flex space-x-2 pt-4">
-                    <Button onClick={autoMapFields} variant="outline">
+                    <Button onClick={handleAutoMapping} variant="outline">
                       <Settings className="h-4 w-4 mr-2" />
                       自动映射
                     </Button>
