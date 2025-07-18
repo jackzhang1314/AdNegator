@@ -149,13 +149,16 @@ export default function AnalysisPage() {
       startRow = 0
     }
 
-    console.log('All lines:', allLines.length)
-    console.log('Filtered lines (no comments):', lines.length)
-    console.log('Header row index:', headerRowIndex)
-    console.log('Detected separator:', lines[headerRowIndex - 1]?.includes('\t') ? 'TAB' : 'COMMA')
-    console.log('Parsed headers:', headers)
-    console.log('Headers count:', headers.length)
-    console.log('Start row:', startRow)
+    // 仅在开发环境中显示调试信息
+    if (typeof window !== 'undefined' && window.location.hostname === 'localhost') {
+      console.log('All lines:', allLines.length)
+      console.log('Filtered lines (no comments):', lines.length)
+      console.log('Header row index:', headerRowIndex)
+      console.log('Detected separator:', lines[headerRowIndex - 1]?.includes('\t') ? 'TAB' : 'COMMA')
+      console.log('Parsed headers:', headers)
+      console.log('Headers count:', headers.length)
+      console.log('Start row:', startRow)
+    }
 
     const data: RawDataRow[] = []
     for (let i = startRow; i < lines.length; i++) {
@@ -295,71 +298,98 @@ export default function AnalysisPage() {
       return
     }
 
-    // setSelectedFile(file) // 移除未使用的状态
+    // 检查文件大小（限制为50MB）
+    const maxSize = 50 * 1024 * 1024 // 50MB in bytes
+    if (file.size > maxSize) {
+      setError('文件大小不能超过50MB')
+      return
+    }
+
     setFileName(file.name)
     setError('')
 
     const reader = new FileReader()
     reader.onload = (event) => {
-      const text = event.target?.result as string
-      setRawFileContent(text) // 保存原始内容
-      const parsed = parseCSV(text)
-      setRawData(parsed)
-      
-      if (parsed.length > 0 && parsed[0]) {
-        const columns = Object.keys(parsed[0]).filter(col => col && col.trim())
-        setAvailableColumns(columns)
+      try {
+        const text = event.target?.result as string
+        if (!text || text.trim() === '') {
+          setError('文件内容为空')
+          return
+        }
+        
+        setRawFileContent(text)
+        const parsed = parseCSV(text)
+        
+        if (parsed.length === 0) {
+          setError('无法解析文件内容，请检查文件格式')
+          return
+        }
+        
+        setRawData(parsed)
+        
+        if (parsed.length > 0 && parsed[0]) {
+          const columns = Object.keys(parsed[0]).filter(col => col && col.trim())
+          setAvailableColumns(columns)
 
-        // 延迟执行自动映射，确保状态已更新（如果开启）
-        if (autoMapping) {
-          setTimeout(() => {
-            // 使用最新的columns进行自动映射
-            const mapping: {[key: string]: string} = {}
+          // 延迟执行自动映射，确保状态已更新（如果开启）
+          if (autoMapping && columns.length > 0) {
+            setTimeout(() => {
+              const mapping: {[key: string]: string} = {}
 
-          const fieldMappings = {
-            searchTerm: ['搜索字词', '搜索词', 'search term', 'query', '查询词'],
-            keyword: ['关键字', '关键词', 'keyword', 'kw'],
-            campaign: ['推广计划', '广告系列', 'campaign', '计划'],
-            adGroup: ['广告组', 'ad group', 'adgroup', '单元'],
-            matchType: ['匹配类型', 'match type', '匹配方式'],
-            impressions: ['展现量', '展示次数', 'impressions', 'impr', '展现次数'],
-            clicks: ['点击次数', '点击量', 'clicks'],
-            cost: ['费用', '花费', 'cost', 'spend'],
-            conversions: ['转化次数', '转化量', 'conversions', 'conv'],
-            conversionValue: ['转化价值', '转化值', 'conversion value', 'conv value', '所有转化价值'],
-            ctr: ['点击率', 'ctr', 'click through rate'],
-            avgCpc: ['平均点击费用', '平均cpc', 'avg cpc', 'average cpc', '平均每次点击费用'],
-            conversionRate: ['转化率', 'conversion rate', 'conv rate']
+              const fieldMappings = {
+                searchTerm: ['搜索字词', '搜索词', 'search term', 'query', '查询词'],
+                keyword: ['关键字', '关键词', 'keyword', 'kw'],
+                campaign: ['推广计划', '广告系列', 'campaign', '计划'],
+                adGroup: ['广告组', 'ad group', 'adgroup', '单元'],
+                matchType: ['匹配类型', 'match type', '匹配方式'],
+                impressions: ['展现量', '展示次数', 'impressions', 'impr', '展现次数'],
+                clicks: ['点击次数', '点击量', 'clicks'],
+                cost: ['费用', '花费', 'cost', 'spend'],
+                conversions: ['转化次数', '转化量', 'conversions', 'conv'],
+                conversionValue: ['转化价值', '转化值', 'conversion value', 'conv value', '所有转化价值'],
+                ctr: ['点击率', 'ctr', 'click through rate'],
+                avgCpc: ['平均点击费用', '平均cpc', 'avg cpc', 'average cpc', '平均每次点击费用'],
+                conversionRate: ['转化率', 'conversion rate', 'conv rate']
+              }
+
+              Object.entries(fieldMappings).forEach(([field, possibleNames]) => {
+                for (const possibleName of possibleNames) {
+                  const matchedColumn = columns.find(col =>
+                    col.toLowerCase().includes(possibleName.toLowerCase()) ||
+                    possibleName.toLowerCase().includes(col.toLowerCase())
+                  )
+                  if (matchedColumn) {
+                    mapping[field] = matchedColumn
+                    break
+                  }
+                }
+              })
+
+              setColumnMapping(mapping)
+            }, 100)
           }
 
-          Object.entries(fieldMappings).forEach(([field, possibleNames]) => {
-            for (const possibleName of possibleNames) {
-              const matchedColumn = columns.find(col =>
-                col.toLowerCase().includes(possibleName.toLowerCase()) ||
-                possibleName.toLowerCase().includes(col.toLowerCase())
-              )
-              if (matchedColumn) {
-                mapping[field] = matchedColumn
-                break
-              }
-            }
-          })
-
-          setColumnMapping(mapping)
-          }, 100)
+          setSelectedTab('mapping')
         }
-
-        setSelectedTab('mapping')
+      } catch (error) {
+        console.error('文件处理错误:', error)
+        setError('文件处理失败，请检查文件格式是否正确')
       }
+    }
+    reader.onerror = () => {
+      setError('文件读取失败，请重试')
     }
     reader.readAsText(file)
   }
 
   // 开始分析 - 实时流式更新版本
   const handleAnalyze = async () => {
-    console.log('开始分析按钮被点击')
-    console.log('rawData length:', rawData.length)
-    console.log('columnMapping:', columnMapping)
+    const isDev = typeof window !== 'undefined' && window.location.hostname === 'localhost'
+    if (isDev) {
+      console.log('开始分析按钮被点击')
+      console.log('rawData length:', rawData.length)
+      console.log('columnMapping:', columnMapping)
+    }
 
     if (rawData.length === 0) {
       setError('请先上传数据')
@@ -377,7 +407,14 @@ export default function AnalysisPage() {
 
     // 处理数据
     const processedData = processDataWithMapping()
-    console.log('Processed data:', processedData.slice(0, 2))
+    if (isDev) {
+      console.log('Processed data:', processedData.slice(0, 2))
+    }
+    
+    if (processedData.length === 0) {
+      setError('处理后的数据为空，请检查数据格式')
+      return
+    }
 
     // 初始化实时分析状态
     const batchSize = 2
@@ -396,14 +433,18 @@ export default function AnalysisPage() {
     setSelectedTab('results') // 立即切换到结果页面
 
     try {
-      console.log(`开始流式分析：${processedData.length}个搜索词，分${totalBatches}个批次`)
+      if (isDev) {
+        console.log(`开始流式分析：${processedData.length}个搜索词，分${totalBatches}个批次`)
+      }
 
       // 分批处理数据
       for (let i = 0; i < processedData.length; i += batchSize) {
         const batch = processedData.slice(i, i + batchSize)
         const currentBatch = Math.floor(i / batchSize) + 1
 
-        console.log(`处理第${currentBatch}/${totalBatches}批次，包含${batch.length}个词`)
+        if (isDev) {
+          console.log(`处理第${currentBatch}/${totalBatches}批次，包含${batch.length}个词`)
+        }
 
         // 更新当前批次进度
         setAnalysisProgress(prev => ({
@@ -423,14 +464,18 @@ export default function AnalysisPage() {
 
           if (!response.ok) {
             const errorText = await response.text()
-            console.error(`批次${currentBatch}API错误:`, errorText)
+            if (isDev) {
+              console.error(`批次${currentBatch}API错误:`, errorText)
+            }
             throw new Error(`批次${currentBatch}分析失败: ${response.status}`)
           }
 
           const data = await response.json()
           const batchResults = data.results || []
 
-          console.log(`批次${currentBatch}完成，获得${batchResults.length}个结果`)
+          if (isDev) {
+            console.log(`批次${currentBatch}完成，获得${batchResults.length}个结果`)
+          }
 
           // 实时更新结果和进度
           setAnalysisResults(prev => [...prev, ...batchResults])
@@ -441,7 +486,9 @@ export default function AnalysisPage() {
           }))
 
         } catch (batchError) {
-          console.error(`批次${currentBatch}处理失败:`, batchError)
+          if (isDev) {
+            console.error(`批次${currentBatch}处理失败:`, batchError)
+          }
           // 继续处理下一批次，不中断整个流程
         }
 
@@ -452,14 +499,18 @@ export default function AnalysisPage() {
       }
 
       // 分析完成
-      console.log('所有批次分析完成')
+      if (isDev) {
+        console.log('所有批次分析完成')
+      }
       setAnalysisProgress(prev => ({
         ...prev,
         isAnalyzing: false
       }))
 
     } catch (err) {
-      console.error('Analysis error:', err)
+      if (isDev) {
+        console.error('Analysis error:', err)
+      }
       setAnalysisProgress(prev => ({
         ...prev,
         isAnalyzing: false
@@ -561,6 +612,17 @@ export default function AnalysisPage() {
 
   return (
     <div className="space-y-6 min-h-screen bg-gray-50">
+      {/* 错误边界显示 */}
+      {error && (
+        <div className="bg-red-50 border border-red-200 rounded-lg p-4 mb-4">
+          <div className="flex items-center">
+            <AlertCircle className="h-5 w-5 text-red-500 mr-2" />
+            <h3 className="text-sm font-medium text-red-800">错误</h3>
+          </div>
+          <p className="mt-1 text-sm text-red-700">{error}</p>
+        </div>
+      )}
+
       {/* 页面标题 */}
       <div className="flex items-center justify-between bg-white p-6 rounded-lg shadow-sm">
         <div>
@@ -773,11 +835,14 @@ export default function AnalysisPage() {
                     </Button>
                     <Button
                       onClick={() => {
-                        console.log('按钮点击检查:')
-                        console.log('- rawData.length:', rawData.length)
-                        console.log('- columnMapping keys:', Object.keys(columnMapping))
-                        console.log('- columnMapping length:', Object.keys(columnMapping).length)
-                        console.log('- 按钮是否禁用:', rawData.length === 0 || Object.keys(columnMapping).length === 0)
+                        const isDevCheck = typeof window !== 'undefined' && window.location.hostname === 'localhost'
+                        if (isDevCheck) {
+                          console.log('按钮点击检查:')
+                          console.log('- rawData.length:', rawData.length)
+                          console.log('- columnMapping keys:', Object.keys(columnMapping))
+                          console.log('- columnMapping length:', Object.keys(columnMapping).length)
+                          console.log('- 按钮是否禁用:', rawData.length === 0 || Object.keys(columnMapping).length === 0)
+                        }
                         handleAnalyze()
                       }}
                       disabled={rawData.length === 0 || Object.keys(columnMapping).length === 0}
