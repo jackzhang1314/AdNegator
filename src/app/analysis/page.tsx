@@ -578,7 +578,7 @@ export default function AnalysisPage() {
           }
           
           // 网络错误或超时处理
-          if (batchError.name === 'AbortError') {
+          if (batchError instanceof Error && batchError.name === 'AbortError') {
             console.error('请求超时')
           }
           
