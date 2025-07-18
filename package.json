@@ -18,8 +18,7 @@
     "test:e2e": "playwright test",
     "db:generate": "supabase gen types typescript --project-id $NEXT_PUBLIC_SUPABASE_PROJECT_ID --schema public > src/types/supabase.ts",
     "db:reset": "supabase db reset",
-    "db:migrate": "supabase migration up",
-    "prepare": "is-ci || husky install"
+    "db:migrate": "supabase migration up"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.3.4",
