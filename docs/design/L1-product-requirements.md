@@ -414,19 +414,155 @@ sandbox = await Sandbox.create({ template: 'my-python-ai' })
 
 ---
 
+#### F7: MCP (Model Context Protocol) Gateway
+
+**用户故事**：
+> 作为 AI 应用开发者，我需要在沙箱中集成外部工具（如 Browserbase、Stripe、GitHub、Notion 等），使 AI 代理能够访问真实世界的应用程序。
+
+**核心价值**：
+- **200+ 预验证工具**：Docker 官方 MCP 目录提供开箱即用的工具集成
+- **安全隔离**：每个工具作为独立容器运行，隔离风险
+- **AI 生态兼容**：支持 Claude Desktop、VSCode 等主流 MCP 客户端
+- **即插即用**：沙箱创建时配置，无需额外部署
+
+**功能点**：
+- [F7.1] MCP 服务器管理
+  - 支持 200+ MCP 工具（Web 自动化、搜索、数据库、云平台、业务工具等）
+  - 提供 MCP 服务器目录 API（按类别浏览、搜索）
+  - 每个服务器有明确的凭证 schema
+
+- [F7.2] 沙箱 MCP 配置
+  - 创建沙箱时配置 MCP 工具及凭证
+  - 凭证加密存储（AES-256-GCM）
+  - 每个工具作为 Docker 容器运行在沙箱网络命名空间中
+
+- [F7.3] MCP Gateway
+  - Sidecar 容器部署在沙箱 Pod 中
+  - 提供统一的 MCP 协议端点
+  - 路由请求到对应的工具容器
+  - Token 认证（Bearer token，24小时过期）
+
+- [F7.4] 动态工具管理
+  - 运行时添加/移除 MCP 工具
+  - 工具容器热启动（< 5s）
+  - 自动健康检查和重启
+
+- [F7.5] SDK 集成
+  - `Sandbox.create({ mcp: { browserbase: {...}, exa: {...} } })`
+  - `sandbox.getMcpUrl()` - 获取 Gateway URL 和 token
+  - `sandbox.addMcpServer(serverId, credentials)` - 动态添加工具
+  - `sandbox.removeMcpServer(serverId)` - 动态移除工具
+  - `listMcpServers({ category, search })` - 浏览工具目录
+
+**MCP 服务器类别**：
+1. **Web 自动化** (7个): Browserbase, Playwright, Puppeteer, Selenium, Apify, Crawl4AI, Firecrawl
+2. **搜索引擎** (9个): Exa, Brave, DuckDuckGo, Google, Kagi, Perplexity, Serper, Tavily, SearXNG
+3. **数据库** (15个): PostgreSQL, MongoDB, Redis, MySQL, SQLite, Neo4j, Elasticsearch, ClickHouse, Supabase, Neon, Turso, PlanetScale, CockroachDB, DynamoDB, CosmosDB
+4. **云平台** (12个): AWS, Azure, GCP, Kubernetes, Docker, Terraform, Cloudflare, Vercel, Netlify, Railway, Fly.io, Render
+5. **开发工具** (18个): GitHub, GitLab, Bitbucket, JetBrains, VSCode, Postman, Sentry, Datadog, New Relic, Grafana, Prometheus, Jenkins, CircleCI, Travis, GitHub Actions, Linear, Jira, Asana
+6. **业务工具** (25个): Stripe, Notion, Slack, Discord, Gmail, Outlook, Calendly, Zoom, HubSpot, Salesforce, Zendesk, Intercom, Twilio, SendGrid, Mailchimp, Shopify, WooCommerce, Airtable, Zapier, IFTTT, Make, n8n, Typeform, Google Sheets, Microsoft Excel
+7. **AI/ML** (15个): OpenAI, Anthropic, Cohere, Pinecone, ChromaDB, Weaviate, Qdrant, Milvus, Hugging Face, Replicate, Gradio, LangChain, LlamaIndex, Needle, Metaphor
+8. **其他** (100+): 文件存储、社交媒体、媒体、金融、地图、天气、翻译、OCR 等
+
+**验收标准**：
+- MCP 请求延迟 < 500ms (p95)
+- 支持 1000+ 并发 MCP 会话
+- 凭证加密/解密延迟 < 10ms
+- 工具容器启动时间 < 5s
+- 100% 兼容 MCP 协议规范
+- 审计所有 MCP 交互（审计日志表）
+
+**使用示例**：
+```typescript
+// TypeScript SDK
+import { Sandbox } from 'e2b'
+
+// 创建带 MCP 工具的沙箱
+const sandbox = await Sandbox.create({
+  template: 'base',
+  mcp: {
+    browserbase: {
+      apiKey: 'sk_...',
+      geminiApiKey: 'AIza...',
+      projectId: 'proj_...'
+    },
+    exa: {
+      apiKey: 'exa_...'
+    },
+    github: {
+      personalAccessToken: 'ghp_...'
+    }
+  }
+})
+
+// 获取 MCP Gateway URL（用于 AI 客户端连接）
+const mcpInfo = await sandbox.getMcpUrl()
+// { url: 'https://sandbox-abc123.e2b.dev/mcp',
+//   token: 'Bearer tok_...',
+//   expiresAt: '...',
+//   servers: ['browserbase', 'exa', 'github'] }
+
+// AI 客户端（如 Claude Desktop）连接到 mcpInfo.url 即可使用工具
+```
+
+```python
+# Python SDK
+from e2b import Sandbox
+
+# 创建带 MCP 工具的沙箱
+sandbox = await Sandbox.create(
+    template='base',
+    mcp={
+        'stripe': {'secretKey': 'sk_...'},
+        'notion': {'internalIntegrationToken': 'secret_...'},
+        'postgresql': {'url': 'postgresql://...'}
+    }
+)
+
+# 获取 MCP Gateway URL
+mcp_info = await sandbox.get_mcp_url()
+
+# 动态添加工具
+await sandbox.add_mcp_server('slack', {
+    'botToken': 'xoxb-...'
+})
+```
+
+**API 端点**：
+- `POST /v1/sandboxes` - 扩展支持 `mcp` 参数
+- `GET /v1/sandboxes/{id}/mcp-url` - 获取 MCP Gateway URL
+- `GET /v1/mcp/servers` - 列出 MCP 服务器目录
+- `GET /v1/mcp/servers/{server_id}` - 获取单个服务器详情
+- `POST /v1/sandboxes/{id}/mcp/servers` - 动态添加工具
+- `DELETE /v1/sandboxes/{id}/mcp/servers/{server_id}` - 动态移除工具
+- `GET /v1/sandboxes/{id}/mcp/servers` - 列出沙箱的 MCP 配置
+
+**非功能性需求**：
+- NFR7.1: MCP 请求延迟 < 500ms (p95)
+- NFR7.2: 支持 1000+ 并发 MCP 会话
+- NFR7.3: 凭证加密/解密延迟 < 10ms
+- NFR7.4: 工具容器启动时间 < 5s
+- NFR7.5: Gateway token 自动过期（默认 24 小时）
+- NFR7.6: 所有 MCP 交互记录审计日志
+- NFR7.7: 支持 MCP 协议版本 1.0+
+
+**优先级**: P0 (核心功能)
+
+---
+
 ### 5.3 未来规划 (P2)
 
-#### F7: 多租户隔离
+#### F8: 多租户隔离
 - 团队/组织账户体系
 - 配额管理（每用户沙盒数量限制）
 - 计费系统集成
 
-#### F8: 高级网络功能
+#### F9: 高级网络功能
 - 沙盒间组网
 - 公网 IP 分配
 - VPN/专线接入
 
-#### F9: GPU 支持
+#### F10: GPU 支持
 - NVIDIA GPU 透传
 - AI 模型推理加速
 
