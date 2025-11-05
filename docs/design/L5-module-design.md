@@ -398,6 +398,453 @@ func (s *CommandsServer) Stream(
 
 ---
 
+### 3.2 mcp-gateway-service 模块
+
+**技术栈**: Go 1.21+ / Docker SDK / net/http
+
+**部署形式**: Sidecar 容器（与沙箱 Pod 共享网络命名空间）
+
+**目录结构**:
+```
+mcp-gateway-service/
+├── cmd/
+│   └── gateway/
+│       └── main.go             # 入口文件
+├── internal/
+│   ├── gateway/
+│   │   ├── gateway.go          # Gateway 核心逻辑
+│   │   ├── router.go           # HTTP 路由和请求处理
+│   │   ├── auth.go             # Token 认证
+│   │   └── proxy.go            # 请求代理到工具容器
+│   ├── docker/
+│   │   ├── client.go           # Docker 客户端封装
+│   │   ├── container.go        # 容器生命周期管理
+│   │   └── health.go           # 容器健康检查
+│   ├── mcp/
+│   │   ├── protocol.go         # MCP 协议定义
+│   │   ├── server.go           # MCP Server 配置
+│   │   └── types.go            # MCP 类型定义
+│   └── config/
+│       └── config.go           # 配置管理
+├── pkg/
+│   └── models/
+│       └── mcp_server.go       # MCP Server 数据模型
+├── Dockerfile
+├── go.mod
+└── README.md
+```
+
+**核心实现**:
+
+```go
+// internal/gateway/gateway.go
+package gateway
+
+import (
+    "context"
+    "fmt"
+    "net/http"
+    "sync"
+    "time"
+
+    "github.com/docker/docker/api/types/container"
+    "github.com/docker/docker/client"
+)
+
+// Gateway 管理 MCP 工具容器和请求路由
+type Gateway struct {
+    dockerClient  *client.Client
+    sandboxID     string
+    configs       map[string]*MCPServerConfig
+    containers    map[string]*ContainerInfo
+    router        *http.ServeMux
+    authProvider  *AuthProvider
+    mu            sync.RWMutex
+}
+
+type MCPServerConfig struct {
+    ServerID    string
+    Image       string
+    Tag         string
+    Credentials map[string]interface{}
+    Port        int
+}
+
+type ContainerInfo struct {
+    ContainerID string
+    ServerID    string
+    Port        int
+    Status      string
+    StartedAt   time.Time
+}
+
+// NewGateway 创建 Gateway 实例
+func NewGateway(sandboxID string, configs map[string]*MCPServerConfig) (*Gateway, error) {
+    dockerClient, err := client.NewClientWithOpts(client.FromEnv)
+    if err != nil {
+        return nil, fmt.Errorf("failed to create docker client: %w", err)
+    }
+
+    g := &Gateway{
+        dockerClient: dockerClient,
+        sandboxID:    sandboxID,
+        configs:      configs,
+        containers:   make(map[string]*ContainerInfo),
+        router:       http.NewServeMux(),
+        authProvider: NewAuthProvider(),
+    }
+
+    // 注册路由
+    g.router.HandleFunc("/mcp/", g.HandleMCPRequest)
+    g.router.HandleFunc("/health", g.HandleHealth)
+    g.router.HandleFunc("/ready", g.HandleReady)
+
+    return g, nil
+}
+
+// Start 启动 Gateway 和所有 MCP 工具容器
+func (g *Gateway) Start(ctx context.Context) error {
+    // 1. 启动所有 MCP 工具容器
+    for serverID, config := range g.configs {
+        containerInfo, err := g.startMCPContainer(ctx, config)
+        if err != nil {
+            return fmt.Errorf("failed to start %s: %w", serverID, err)
+        }
+
+        g.mu.Lock()
+        g.containers[serverID] = containerInfo
+        g.mu.Unlock()
+
+        log.Printf("Started MCP server: %s (container: %s)", serverID, containerInfo.ContainerID)
+    }
+
+    // 2. 启动健康检查
+    go g.healthCheckLoop(ctx)
+
+    // 3. 启动 HTTP 服务器
+    log.Printf("MCP Gateway listening on :8000")
+    return http.ListenAndServe(":8000", g.router)
+}
+
+// startMCPContainer 启动单个 MCP 工具容器
+func (g *Gateway) startMCPContainer(ctx context.Context, config *MCPServerConfig) (*ContainerInfo, error) {
+    // 1. 配置环境变量（凭证）
+    envVars := []string{}
+    for key, value := range config.Credentials {
+        envVars = append(envVars, fmt.Sprintf("%s=%v", key, value))
+    }
+
+    // 2. 创建容器配置
+    containerConfig := &container.Config{
+        Image: fmt.Sprintf("%s:%s", config.Image, config.Tag),
+        Env:   envVars,
+    }
+
+    hostConfig := &container.HostConfig{
+        // 共享沙箱的网络命名空间
+        NetworkMode: container.NetworkMode(fmt.Sprintf("container:%s", g.sandboxID)),
+        // 资源限制
+        Resources: container.Resources{
+            Memory:   512 * 1024 * 1024, // 512MB
+            NanoCPUs: 500000000,          // 0.5 CPU
+        },
+    }
+
+    // 3. 创建容器
+    resp, err := g.dockerClient.ContainerCreate(
+        ctx,
+        containerConfig,
+        hostConfig,
+        nil,
+        nil,
+        fmt.Sprintf("mcp-%s-%s", g.sandboxID, config.ServerID),
+    )
+    if err != nil {
+        return nil, fmt.Errorf("failed to create container: %w", err)
+    }
+
+    // 4. 启动容器
+    if err := g.dockerClient.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+        return nil, fmt.Errorf("failed to start container: %w", err)
+    }
+
+    return &ContainerInfo{
+        ContainerID: resp.ID,
+        ServerID:    config.ServerID,
+        Port:        config.Port,
+        Status:      "running",
+        StartedAt:   time.Now(),
+    }, nil
+}
+
+// HandleMCPRequest 处理 MCP 协议请求
+func (g *Gateway) HandleMCPRequest(w http.ResponseWriter, r *http.Request) {
+    // 1. 验证访问令牌
+    token := r.Header.Get("Authorization")
+    if !g.authProvider.Validate(token, g.sandboxID) {
+        http.Error(w, "Unauthorized", http.StatusUnauthorized)
+        return
+    }
+
+    // 2. 解析 MCP 请求
+    var mcpReq struct {
+        Server string                 `json:"server"`
+        Method string                 `json:"method"`
+        Params map[string]interface{} `json:"params"`
+    }
+
+    if err := json.NewDecoder(r.Body).Decode(&mcpReq); err != nil {
+        http.Error(w, "Invalid request", http.StatusBadRequest)
+        return
+    }
+
+    // 3. 获取目标容器
+    g.mu.RLock()
+    container, ok := g.containers[mcpReq.Server]
+    g.mu.RUnlock()
+
+    if !ok {
+        http.Error(w, "MCP server not found", http.StatusNotFound)
+        return
+    }
+
+    // 4. 代理请求到工具容器
+    targetURL := fmt.Sprintf("http://localhost:%d%s", container.Port, r.URL.Path)
+    proxyReq, err := http.NewRequest(r.Method, targetURL, r.Body)
+    if err != nil {
+        http.Error(w, "Proxy error", http.StatusInternalServerError)
+        return
+    }
+
+    // 复制请求头
+    for key, values := range r.Header {
+        for _, value := range values {
+            proxyReq.Header.Add(key, value)
+        }
+    }
+
+    // 5. 发送请求
+    client := &http.Client{Timeout: 30 * time.Second}
+    resp, err := client.Do(proxyReq)
+    if err != nil {
+        http.Error(w, "Tool error", http.StatusBadGateway)
+        return
+    }
+    defer resp.Body.Close()
+
+    // 6. 返回响应
+    for key, values := range resp.Header {
+        for _, value := range values {
+            w.Header().Add(key, value)
+        }
+    }
+    w.WriteHeader(resp.StatusCode)
+    io.Copy(w, resp.Body)
+
+    // 7. 记录审计日志
+    g.logAudit(r, resp, mcpReq.Server, mcpReq.Method)
+}
+
+// healthCheckLoop 定期检查工具容器状态
+func (g *Gateway) healthCheckLoop(ctx context.Context) {
+    ticker := time.NewTicker(10 * time.Second)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-ticker.C:
+            g.checkAllContainers(ctx)
+        case <-ctx.Done():
+            return
+        }
+    }
+}
+
+func (g *Gateway) checkAllContainers(ctx context.Context) {
+    g.mu.RLock()
+    containers := make([]*ContainerInfo, 0, len(g.containers))
+    for _, c := range g.containers {
+        containers = append(containers, c)
+    }
+    g.mu.RUnlock()
+
+    for _, containerInfo := range containers {
+        inspect, err := g.dockerClient.ContainerInspect(ctx, containerInfo.ContainerID)
+        if err != nil || !inspect.State.Running {
+            log.Printf("Container %s (%s) is unhealthy, restarting...",
+                containerInfo.ServerID, containerInfo.ContainerID)
+
+            // 尝试重启容器
+            if err := g.restartContainer(ctx, containerInfo); err != nil {
+                log.Printf("Failed to restart container %s: %v",
+                    containerInfo.ServerID, err)
+            }
+        }
+    }
+}
+
+func (g *Gateway) restartContainer(ctx context.Context, info *ContainerInfo) error {
+    // 停止旧容器
+    timeout := 10
+    if err := g.dockerClient.ContainerStop(ctx, info.ContainerID, container.StopOptions{
+        Timeout: &timeout,
+    }); err != nil {
+        log.Printf("Warning: failed to stop container: %v", err)
+    }
+
+    // 启动新容器
+    config := g.configs[info.ServerID]
+    newContainer, err := g.startMCPContainer(ctx, config)
+    if err != nil {
+        return err
+    }
+
+    // 更新容器信息
+    g.mu.Lock()
+    g.containers[info.ServerID] = newContainer
+    g.mu.Unlock()
+
+    return nil
+}
+
+// HandleHealth 健康检查端点
+func (g *Gateway) HandleHealth(w http.ResponseWriter, r *http.Request) {
+    w.WriteHeader(http.StatusOK)
+    json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// HandleReady 就绪检查端点
+func (g *Gateway) HandleReady(w http.ResponseWriter, r *http.Request) {
+    // 检查所有容器是否就绪
+    g.mu.RLock()
+    allReady := true
+    for _, container := range g.containers {
+        if container.Status != "running" {
+            allReady = false
+            break
+        }
+    }
+    g.mu.RUnlock()
+
+    if allReady {
+        w.WriteHeader(http.StatusOK)
+        json.NewEncoder(w).Encode(map[string]bool{"ready": true})
+    } else {
+        w.WriteHeader(http.StatusServiceUnavailable)
+        json.NewEncoder(w).Encode(map[string]bool{"ready": false})
+    }
+}
+
+// Shutdown 优雅关闭
+func (g *Gateway) Shutdown(ctx context.Context) error {
+    // 停止所有工具容器
+    g.mu.RLock()
+    containers := make([]*ContainerInfo, 0, len(g.containers))
+    for _, c := range g.containers {
+        containers = append(containers, c)
+    }
+    g.mu.RUnlock()
+
+    for _, container := range containers {
+        timeout := 10
+        if err := g.dockerClient.ContainerStop(ctx, container.ContainerID, container.StopOptions{
+            Timeout: &timeout,
+        }); err != nil {
+            log.Printf("Warning: failed to stop container %s: %v",
+                container.ServerID, err)
+        }
+    }
+
+    return nil
+}
+```
+
+```go
+// internal/gateway/auth.go
+package gateway
+
+import (
+    "database/sql"
+    "time"
+
+    _ "github.com/lib/pq"
+)
+
+type AuthProvider struct {
+    db *sql.DB
+}
+
+func NewAuthProvider() *AuthProvider {
+    // 连接到控制平面数据库
+    db, err := sql.Open("postgres", os.Getenv("DATABASE_URL"))
+    if err != nil {
+        log.Fatalf("Failed to connect to database: %v", err)
+    }
+
+    return &AuthProvider{db: db}
+}
+
+// Validate 验证 Bearer token
+func (a *AuthProvider) Validate(token string, sandboxID string) bool {
+    if token == "" {
+        return false
+    }
+
+    // 查询 mcp_gateway_sessions 表
+    var session struct {
+        Status    string
+        ExpiresAt time.Time
+    }
+
+    err := a.db.QueryRow(
+        `SELECT status, token_expires_at
+         FROM mcp_gateway_sessions
+         WHERE access_token = $1 AND sandbox_id = $2`,
+        token, sandboxID,
+    ).Scan(&session.Status, &session.ExpiresAt)
+
+    if err != nil {
+        return false
+    }
+
+    // 检查状态和过期时间
+    return session.Status == "active" && time.Now().Before(session.ExpiresAt)
+}
+```
+
+**关键特性**:
+
+1. **容器生命周期管理**
+   - 启动时批量创建所有 MCP 工具容器
+   - 共享沙箱的网络命名空间（localhost 通信）
+   - 自动健康检查和重启
+
+2. **请求路由**
+   - 解析 MCP 协议请求
+   - 根据 `server` 字段路由到对应容器
+   - 透明代理请求和响应
+
+3. **认证与安全**
+   - Bearer token 认证（查询控制平面数据库）
+   - Token 过期检查
+   - 容器资源限制（CPU/内存）
+
+4. **可观测性**
+   - 健康检查端点 (`/health`)
+   - 就绪检查端点 (`/ready`)
+   - 审计日志记录
+
+**性能指标**:
+- Gateway 启动时间: < 1s
+- 工具容器启动时间: < 5s
+- MCP 请求延迟 (p95): < 500ms
+- 内存占用: < 50MB (Gateway) + 512MB (每个工具容器)
+
+**对应 L2 设计**: 5.4 MCP Gateway Service
+**对应 L1 需求**: F7.3 (MCP Gateway), F7.4 (动态工具管理)
+
+---
+
 ## 4. Common 模块
 
 ### 4.1 共享库
