@@ -37,7 +37,7 @@
 |--------------|---------|-------------|
 | F1: 沙盒生命周期管理 | 高可用的控制平面 | Nomad Server Cluster (3节点) |
 | F2: 代码执行引擎 | 低延迟的数据平面 | Firecracker microVM (125ms启动) |
-| F3: E2B SDK 兼容 | REST API + gRPC 双协议 | TypeScript API + Go Orchestrator |
+| F3: E2B SDK 兼容 | REST API + gRPC 双协议 | **Go API** + Go Orchestrator |
 | NFR: 性能 < 2s 冷启动 | 极速虚拟化 | Firecracker (vs Docker 10x faster) |
 | NFR: 并发 1000+ 沙盒 | 水平扩展架构 | Nomad Client自动扩缩容 |
 | NFR: 安全隔离 | 硬件级虚拟化 | Firecracker + KVM (vs gVisor syscall) |
@@ -93,13 +93,13 @@
 └──────────────────────────────────────────────────────────────────────────┘
                                     ▼
 ┌──────────────────────────────────────────────────────────────────────────┐
-│                      API集群 (TypeScript/Node.js)                         │
+│                      API集群 (Go/Gin Framework)                           │
 ├──────────────────────────────────────────────────────────────────────────┤
 │  ┌────────────────────────────────────────────────────────────────────┐  │
-│  │  API Server (TypeScript - packages/api/)                          │  │
+│  │  API Server (Go - packages/api/)                                  │  │
 │  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────────┐ │  │
 │  │  │ REST API     │  │ 认证/授权     │  │ 速率限制                  │ │  │
-│  │  │ (Express)    │  │ (API Key/    │  │ (Redis Token Bucket)     │ │  │
+│  │  │ (Gin)        │  │ (API Key/    │  │ (Redis Token Bucket)     │ │  │
 │  │  │              │  │  Access Token)│  │                          │ │  │
 │  │  └──────────────┘  └──────────────┘  └──────────────────────────┘ │  │
 │  └────────────────────────────────────────────────────────────────────┘  │
@@ -218,7 +218,7 @@
 | 层级 | E2B官方技术 | 说明 |
 |------|-----------|------|
 | **客户端SDK** | E2B SDK (TypeScript/Python v2.6.2) | 100%兼容，直接使用 |
-| **API层** | TypeScript (Express/Node.js) | REST API网关 |
+| **API层** | **Go (Gin Framework)** | REST API网关 |
 | **编排层** | **Nomad** (替代Kubernetes) | 轻量级调度，专为批处理优化 |
 | **服务发现** | **Consul** | 动态服务注册和健康检查 |
 | **核心服务** | **Go** (packages/orchestrator) | 高性能gRPC服务 |
@@ -238,7 +238,7 @@
 ```
 1. Client SDK (E2B SDK)
    ↓ POST /sandboxes {templateID: "python-3.11"}
-2. API Server (TypeScript)
+2. API Server (Go/Gin)
    ↓ 认证 (API Key) + 速率限制 (Redis)
 3. Orchestrator (Go gRPC)
    ↓ 调用 CreateSandbox RPC
@@ -297,7 +297,7 @@
 ```
 1. Client SDK
    ↓ POST /sandboxes/{id}/pause
-2. API Server (TypeScript)
+2. API Server (Go/Gin)
    ↓ gRPC调用
 3. Orchestrator (Go)
    ↓ 调用 Firecracker CRIU
@@ -354,7 +354,7 @@
 ```
 ┌────────────────────────────────────────────────┐
 │  L1: API Gateway Layer (API 网关层)            │
-│  - TypeScript Express REST API                │
+│  - **Go Gin** REST API                │
 │  - OpenAPI Schema (E2B Compatible)            │
 │  - Request/Response Validation                │
 │  - Authentication & Rate Limiting             │
@@ -418,101 +418,168 @@
 
 ### 5.1 API 网关层组件
 
-#### 5.1.1 API Server (TypeScript/Express)
+#### 5.1.1 API Server (Go/Gin)
 
 **职责**：
 - 接收 REST API 请求 (E2B SDK compatible)
 - 双重认证：API Key (控制平面) + Access Token (数据平面)
-- 请求参数校验和序列化
+- 请求参数校验和序列化 (OpenAPI 3.0)
 - 速率限制 (Token Bucket 算法 via Redis)
 - 调用 Orchestrator gRPC 服务
 - 返回标准化 HTTP 响应
 
-**技术选型**：
-- **框架**: Express.js (Node.js 20+)
-- **代码位置**: `packages/api/`
-- **数据验证**: Zod (TypeScript schema validation)
-- **ORM**: Prisma (PostgreSQL)
-- **HTTP客户端**: node-fetch / axios
+**技术选型** (基于 E2B 官方 `/tmp/infra/packages/api/`):
+- **语言**: Go 1.21+
+- **框架**: Gin Web Framework
+- **代码位置**: `packages/api/` (Go module)
+- **OpenAPI**: oapi-codegen (自动生成代码)
+- **数据库**: database/sql + pgx driver
+- **ClickHouse**: clickhouse-go
+- **gRPC**: google.golang.org/grpc
 
-**关键路由**：
-```typescript
-// packages/api/src/routes/sandboxes.ts
-router.post('/sandboxes', async (req, res) => {
-  // 1. 验证 API Key (X-API-Key header)
-  // 2. 速率限制检查 (Redis)
-  // 3. 调用 Orchestrator.CreateSandbox (gRPC)
-  // 4. 返回 SandboxResponse {sandboxID, domain, envdAccessToken}
-})
+**关键路由** (基于 E2B 官方实现):
+```go
+// packages/api/internal/handlers/sandbox.go
+func (s *APIStore) PostSandboxes(c *gin.Context, params api.PostSandboxesParams) {
+  // 1. 验证 API Key (从 context 获取 team)
+  team := c.Value(auth.TeamContextKey).(*types.Team)
 
-router.get('/sandboxes/:id', async (req, res) => {
-  // 1. 从 PostgreSQL 查询 sandbox 元数据
-  // 2. 可选：从 Orchestrator 查询实时状态
-})
+  // 2. 解析请求体
+  var req api.PostSandboxesJSONRequestBody
+  if err := c.BindJSON(&req); err != nil {
+    c.JSON(400, gin.H{"error": "invalid request"})
+    return
+  }
 
-router.post('/sandboxes/:id/pause', async (req, res) => {
-  // 1. 调用 Orchestrator.PauseSandbox (gRPC)
-  // 2. 等待 CRIU snapshot 完成
-})
+  // 3. 速率限制检查 (Redis)
+  if err := s.rateLimiter.Check(team.ID); err != nil {
+    c.JSON(429, gin.H{"error": "rate limit exceeded"})
+    return
+  }
 
-router.delete('/sandboxes/:id', async (req, res) => {
-  // 1. 调用 Orchestrator.DeleteSandbox (gRPC)
-  // 2. 更新 PostgreSQL (soft delete)
-})
-```
+  // 4. 调用 Orchestrator.CreateSandbox (gRPC)
+  ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+  defer cancel()
 
-**认证流程**：
-```typescript
-// 双重认证机制
-interface AuthContext {
-  // 控制平面认证 (API → Orchestrator)
-  apiKey: string           // X-API-Key header
+  orchResp, err := s.orchestrator.CreateSandbox(ctx, &pb.CreateSandboxRequest{
+    SandboxId:  generateSandboxID(),
+    TemplateId: req.TemplateId,
+    Vcpu:       2,
+    RamMb:      2048,
+  })
 
-  // 数据平面认证 (SDK → envd)
-  envdAccessToken: string  // JWT token, 包含 sandbox_id
+  // 5. 返回 SandboxResponse
+  c.JSON(201, api.Sandbox{
+    SandboxId:      orchResp.SandboxId,
+    EnvdAccessToken: generateEnvdToken(orchResp.SandboxId),
+    ClientId:       orchResp.ClientId,
+  })
 }
 
-// API Key 验证
-async function authenticateAPIKey(apiKey: string): Promise<User> {
-  const key = await prisma.apiKey.findUnique({
-    where: { key: apiKey, revoked: false },
-    include: { user: true }
+func (s *APIStore) GetSandboxesSandboxID(c *gin.Context, sandboxID string) {
+  // 1. 从 PostgreSQL 查询 sandbox 元数据
+  var sb types.Sandbox
+  err := s.db.QueryRow(`SELECT * FROM sandboxes WHERE id = $1`, sandboxID).Scan(&sb)
+
+  // 2. 返回响应
+  c.JSON(200, api.Sandbox{...})
+}
+
+func (s *APIStore) DeleteSandboxesSandboxID(c *gin.Context, sandboxID string) {
+  // 1. 调用 Orchestrator.KillSandbox (gRPC)
+  _, err := s.orchestrator.KillSandbox(ctx, &pb.KillSandboxRequest{
+    SandboxId: sandboxID,
   })
-  if (!key || key.expiresAt < new Date()) {
-    throw new AuthenticationError()
+
+  // 2. 更新 PostgreSQL (soft delete)
+  s.db.Exec(`UPDATE sandboxes SET deleted_at = NOW() WHERE id = $1`, sandboxID)
+
+  c.JSON(204, nil)
+}
+```
+
+**认证流程** (基于 E2B 官方):
+```go
+// packages/api/internal/auth/auth.go
+
+type AuthContext struct {
+  // 控制平面认证 (API → Orchestrator)
+  Team    *types.Team
+  APIKey  string
+
+  // 数据平面认证 (SDK → envd)
+  EnvdAccessToken string  // JWT token, 包含 sandbox_id
+}
+
+// API Key 验证 (Gin middleware)
+func CreateAuthenticationFunc(config cfg.Config, getTeamFromAPIKey func(string) (*types.Team, error)) gin.HandlerFunc {
+  return func(c *gin.Context) {
+    // 1. 提取 API Key (X-API-Key header)
+    apiKey := c.GetHeader("X-API-Key")
+    if apiKey == "" {
+      c.AbortWithStatusJSON(401, gin.H{"error": "missing API key"})
+      return
+    }
+
+    // 2. 验证 API Key (from PostgreSQL team_api_keys table)
+    team, err := getTeamFromAPIKey(apiKey)
+    if err != nil {
+      c.AbortWithStatusJSON(401, gin.H{"error": "invalid API key"})
+      return
+    }
+
+    // 3. 检查 team 是否被封禁
+    if team.IsBlocked {
+      c.AbortWithStatusJSON(403, gin.H{"error": "team blocked"})
+      return
+    }
+
+    // 4. 保存到 context
+    c.Set(auth.TeamContextKey, team)
+    c.Next()
   }
-  return key.user
 }
 
 // envd Access Token 生成 (JWT)
-function generateEnvdToken(sandboxID: string): string {
-  return jwt.sign(
-    { sandbox_id: sandboxID },
-    process.env.ENVD_JWT_SECRET,
-    { expiresIn: '24h', algorithm: 'HS256' }
-  )
+func generateEnvdToken(sandboxID string, secret string) string {
+  token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+    "sandbox_id": sandboxID,
+    "exp":        time.Now().Add(24 * time.Hour).Unix(),
+  })
+  tokenString, _ := token.SignedString([]byte(secret))
+  return tokenString
 }
 ```
 
-**速率限制**：
-```typescript
-// Token Bucket 算法 (Redis)
-async function rateLimitCheck(userID: string, tier: 'hobby' | 'pro' | 'enterprise'): Promise<void> {
-  const limits = {
-    hobby: { rps: 10, burst: 20 },
-    pro: { rps: 100, burst: 200 },
-    enterprise: { rps: 1000, burst: 2000 }
+**速率限制** (基于 Redis):
+```go
+// Token Bucket 算法
+type RateLimiter struct {
+  redis *redis.Client
+}
+
+func (r *RateLimiter) Check(teamID string, tier string) error {
+  limits := map[string]struct{rps int; burst int}{
+    "free":       {rps: 10, burst: 20},
+    "pro":        {rps: 100, burst: 200},
+    "enterprise": {rps: 1000, burst: 2000},
   }
 
-  const key = `rate_limit:${userID}`
-  const current = await redis.incr(key)
-  if (current === 1) {
-    await redis.expire(key, 1) // 1秒窗口
+  key := fmt.Sprintf("rate_limit:%s", teamID)
+  current, err := r.redis.Incr(context.Background(), key).Result()
+  if err != nil {
+    return err
   }
 
-  if (current > limits[tier].rps) {
-    throw new RateLimitError({ retryAfter: 1 })
+  if current == 1 {
+    r.redis.Expire(context.Background(), key, 1*time.Second)
   }
+
+  if int(current) > limits[tier].rps {
+    return fmt.Errorf("rate limit exceeded")
+  }
+
+  return nil
 }
 ```
 
@@ -1483,7 +1550,7 @@ build {
 | **虚拟化** | **Firecracker** | v1.5+ | 125ms启动，5MB开销，硬件级隔离 |
 | **任务调度** | **Nomad** | 1.6+ | 轻量级，专为批处理优化 |
 | **服务发现** | **Consul** | 1.16+ | 动态服务注册和健康检查 |
-| **API网关** | **TypeScript/Express** | Node.js 20+ | E2B官方API层 (packages/api/) |
+| **API网关** | **Go/Gin** | Go 1.21+ | E2B官方API层 (packages/api/) |
 | **编排器** | **Go** | 1.21+ | E2B官方Orchestrator (packages/orchestrator/) |
 | **数据平面** | **Go (envd)** | 1.21+ | VM内gRPC服务 (packages/envd/) |
 | **RPC 协议** | **gRPC + Connect** | latest | 流式通信，低延迟 |
@@ -1507,7 +1574,7 @@ build {
 |------|-------|--------------|------|
 | **虚拟化** | gVisor (syscall) | **Firecracker (KVM)** | 4-8x 启动速度，10x 密度 |
 | **编排** | Kubernetes | **Nomad** | 简单部署，专为VM优化 |
-| **API语言** | Python (FastAPI) | **TypeScript (Express)** | E2B SDK官方兼容 |
+| **API语言** | Python (FastAPI) | **Go (Gin)** | E2B SDK官方兼容 |
 | **核心服务** | Python | **Go** | 5x 吞吐，原生并发 |
 | **分析数据库** | TimescaleDB | **ClickHouse** | 10-100x 查询速度 |
 | **任务队列** | Celery | **无（同步调用）** | 简化架构 |
@@ -1531,7 +1598,7 @@ build {
 ```
 E2B/
 ├── packages/
-│   ├── api/                    # TypeScript API网关
+│   ├── api/                    # Go API网关
 │   │   ├── src/routes/
 │   │   ├── src/middleware/
 │   │   └── package.json
@@ -1648,27 +1715,37 @@ E2B/
 
 ---
 
-### 8.4 ADR-004: API 网关采用 TypeScript/Node.js (E2B 官方)
+### 8.4 ADR-004: API 网关采用 Go/Gin (E2B 官方)
 
 **背景**：需要 REST API 完全兼容 E2B SDK
 
-**决策**：API 网关采用 **TypeScript + Express** (packages/api/)（替代 Python FastAPI）
+**决策**：API 网关采用 **Go + Gin** (packages/api/)（替代 Python FastAPI 或 TypeScript/Express）
 
-**理由**：
-- ✅ **E2B 官方 API 层**：100% 兼容 E2B SDK（TypeScript/Python）
-- ✅ **生态丰富**：npm 生态支持完善
-- ✅ **类型安全**：TypeScript 提供编译时检查
-- ✅ **异步 I/O**：Node.js 天然适合 I/O 密集场景
-- ✅ **E2B 源码可直接复用**：packages/api/ 可直接参考
+**理由** (基于 E2B 官方实现 `/tmp/infra/packages/api/`):
+- ✅ **E2B 官方 API 层**：E2B infra 官方使用 Go + Gin，100% 兼容 E2B SDK
+- ✅ **高性能**：Go 编译型语言，并发性能优秀（goroutines）
+- ✅ **类型安全**：静态类型 + 编译时检查
+- ✅ **低资源占用**：内存占用低，适合大规模部署
+- ✅ **OpenAPI 原生支持**：oapi-codegen 自动生成 OpenAPI 代码
+- ✅ **gRPC 原生支持**：与 Orchestrator 无缝集成
+
+**技术栈** (基于 E2B 官方):
+- **语言**: Go 1.21+
+- **Web 框架**: Gin
+- **OpenAPI**: oapi-codegen (生成 handlers 和 types)
+- **数据库**: database/sql + pgx (PostgreSQL) + clickhouse-go
+- **gRPC**: google.golang.org/grpc
+- **监控**: OpenTelemetry (OTEL)
 
 **权衡**：
-- ⚠️ 单线程（但 I/O 密集型，影响小）
-- ⚠️ 性能略低于 Go（但API层非瓶颈）
+- ⚠️ 学习曲线（Go 语法）
+- ✅ 性能优于 Python/Node.js（关键优势）
+- ✅ 编译型语言，部署简单（单二进制）
 
 **后果**：
-- 使用 pnpm 管理 Node.js 依赖
-- Prisma ORM 连接 PostgreSQL
-- Zod 进行 schema 验证
+- 使用 Go modules (go.mod) 管理依赖
+- 使用 database/sql 连接 PostgreSQL (无 ORM)
+- 使用 OpenAPI 3.0 规范自动生成代码
 
 ---
 
@@ -1760,7 +1837,7 @@ E2B/
 | 虚拟化 | gVisor | **Firecracker** | ADR-001 |
 | 编排 | Kubernetes | **Nomad** | ADR-002 |
 | 核心服务语言 | Python | **Go** | ADR-003 |
-| API 语言 | Python FastAPI | **TypeScript Express** | ADR-004 |
+| API 语言 | Python FastAPI | **Go Gin** | ADR-004 |
 | 分析数据库 | TimescaleDB | **ClickHouse** | ADR-005 |
 | IaC | 手动 | **Terraform + Packer** | ADR-006 |
 | 任务队列 | Celery | **无（同步）** | ADR-007 |
@@ -2581,43 +2658,69 @@ service:
       exporters: [otlp]
 ```
 
-#### 12.3.3 TypeScript 追踪示例 (API Server)
+#### 12.3.3 Go 追踪示例 (API Server)
 
-```typescript
-import { trace, context } from '@opentelemetry/api'
-import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-grpc'
+```go
+// packages/api/internal/handlers/sandbox.go
+import (
+  "context"
+  "go.opentelemetry.io/otel"
+  "go.opentelemetry.io/otel/attribute"
+  "go.opentelemetry.io/otel/codes"
+  "go.opentelemetry.io/otel/trace"
+)
 
-const tracer = trace.getTracer('api-server')
+var tracer = otel.Tracer("api-server")
 
-async function createSandbox(req: Request): Promise<Response> {
-  const span = tracer.startSpan('api.createSandbox')
+func (s *APIStore) PostSandboxes(c *gin.Context, params api.PostSandboxesParams) {
+  ctx, span := tracer.Start(c.Request.Context(), "api.createSandbox")
+  defer span.End()
 
-  try {
-    // 认证
-    const authSpan = tracer.startSpan('api.authenticate', { parent: span })
-    const user = await authenticateAPIKey(req.headers['x-api-key'])
-    authSpan.end()
+  // 认证 (自动从 middleware 获取)
+  team := c.Value(auth.TeamContextKey).(*types.Team)
 
-    // 调用 Orchestrator (自动传播 trace context)
-    const orchestratorSpan = tracer.startSpan('api.callOrchestrator', { parent: span })
-    const sandbox = await orchestratorClient.CreateSandbox({
-      template_id: req.body.templateID
-    })
-    orchestratorSpan.setAttribute('sandbox_id', sandbox.sandboxID)
-    orchestratorSpan.end()
-
-    span.setAttribute('user_id', user.id)
-    span.setAttribute('sandbox_id', sandbox.sandboxID)
-    span.setStatus({ code: SpanStatusCode.OK })
-
-    return { sandboxID: sandbox.sandboxID }
-  } catch (error) {
-    span.recordException(error)
-    span.setStatus({ code: SpanStatusCode.ERROR, message: error.message })
-    throw error
-  } finally {
-    span.end()
+  // 解析请求体
+  var req api.PostSandboxesJSONRequestBody
+  if err := c.BindJSON(&req); err != nil {
+    span.RecordError(err)
+    span.SetStatus(codes.Error, "invalid request")
+    c.JSON(400, gin.H{"error": err.Error()})
+    return
   }
+
+  // 调用 Orchestrator (自动传播 trace context)
+  orchCtx, orchSpan := tracer.Start(ctx, "api.callOrchestrator")
+  orchResp, err := s.orchestrator.CreateSandbox(orchCtx, &pb.CreateSandboxRequest{
+    SandboxId:  generateSandboxID(),
+    TemplateId: req.TemplateId,
+    Vcpu:       2,
+    RamMb:      2048,
+  })
+  orchSpan.SetAttributes(
+    attribute.String("sandbox_id", orchResp.SandboxId),
+    attribute.String("template_id", req.TemplateId),
+  )
+  orchSpan.End()
+
+  if err != nil {
+    span.RecordError(err)
+    span.SetStatus(codes.Error, err.Error())
+    c.JSON(500, gin.H{"error": "orchestrator error"})
+    return
+  }
+
+  // 记录 span 属性
+  span.SetAttributes(
+    attribute.String("team_id", team.ID),
+    attribute.String("sandbox_id", orchResp.SandboxId),
+  )
+  span.SetStatus(codes.Ok, "sandbox created")
+
+  c.JSON(201, api.Sandbox{
+    SandboxId:      orchResp.SandboxId,
+    EnvdAccessToken: generateEnvdToken(orchResp.SandboxId),
+    ClientId:       orchResp.ClientId,
+  })
 }
 ```
 
