@@ -195,6 +195,12 @@ gVisor E2B 是一个基于 gVisor 容器运行时的**代码执行沙盒平台**
   - 支持按状态筛选
   - 支持分页
 
+- [F1.6] 自动暂停 (autoPause) **[E2B 兼容功能]**
+  - 检测沙盒空闲时间（无活跃进程执行）
+  - 达到空闲阈值后自动暂停
+  - 下次访问时自动恢复
+  - 节省资源成本
+
 **验收标准**：
 - 创建到可用 < 2s (99th percentile)
 - 暂停操作 < 3s (1GB 内存)
@@ -259,24 +265,139 @@ gVisor E2B 是一个基于 gVisor 容器运行时的**代码执行沙盒平台**
 
 ### 5.2 增强功能 (P1)
 
-#### F4: 模板管理
+#### F4: 自定义沙盒模板构建系统 **[E2B Build System 2.0 兼容]**
 
 **用户故事**：
-> 作为平台运营者，我需要预制包含常用依赖的镜像模板，加速沙盒启动。
+> 作为开发者，我需要通过 Dockerfile 定义自定义沙盒环境，预装依赖和配置，快速启动预配置好的沙盒。
+
+**核心价值**：
+- 快速启动：预构建镜像避免每次沙盒创建时安装依赖
+- 版本管理：支持多环境配置（dev/prod）
+- 缓存优化：增量构建，复用已构建的层
+- E2B 兼容：100% 兼容 E2B 构建系统 API 和工作流
 
 **功能点**：
-- [F4.1] 创建模板 (`POST /templates`)
-- [F4.2] 列出模板 (`GET /templates`)
-- [F4.3] 删除模板 (`DELETE /templates/{id}`)
-- [F4.4] 预热机制（模板预拉取）
+- [F4.1] 模板配置（`e2b.toml`）
+  - `template_id`: 唯一模板标识符
+  - `template_name`: 可读别名
+  - `dockerfile`: Dockerfile 路径
+  - `memory_mb`: 内存限制（默认 512MB）
+  - `cpu_count`: CPU 核心数（默认 2）
+  - `start_cmd`: 启动命令（可选）
+  - `team_id`: 团队标识符
+
+- [F4.2] 模板初始化（CLI）
+  - `e2b template init` - 初始化模板项目
+  - 生成 `e2b.toml` 配置文件
+  - 生成 `e2b.Dockerfile` 示例
+  - 生成构建脚本（TypeScript/Python）
+  - 生成 README.md 文档
+
+- [F4.3] 模板构建流程
+  - **Step 1**: 请求构建 (`POST /v3/templates`)
+    - 提交 alias, cpuCount, memoryMB
+    - 返回 templateID, buildID
+  - **Step 2**: 上传文件
+    - 获取上传链接 (`GET /templates/{templateID}/files/{hash}`)
+    - 上传 Dockerfile 和上下文文件（tar.gz 格式）
+  - **Step 3**: 触发构建 (`POST /v2/templates/{templateID}/builds/{buildID}`)
+    - 提交构建配置（Dockerfile path, env vars, etc.）
+  - **Step 4**: 轮询构建状态 (`GET /templates/{templateID}/builds/{buildID}/status`)
+    - 状态流转：`waiting` → `building` → `ready` / `error`
+    - 实时获取构建日志
+  - **Step 5**: 构建完成
+    - 生成可用的模板镜像
+    - 可通过 template_id 或 template_name 创建沙盒
+
+- [F4.4] 模板版本管理
+  - 支持重建模板（`POST /templates/{templateID}`）
+  - 保留构建历史
+  - 支持多环境配置（dev/prod/staging）
+
+- [F4.5] Dockerfile 支持
+  - 基于标准 Dockerfile 语法
+  - 支持多阶段构建
+  - 支持 ARG 和 ENV 变量
+  - 支持 COPY/ADD 指令
+
+- [F4.6] CLI 命令
+  - `e2b template init` - 初始化模板
+  - `e2b template build` - 构建模板
+  - `e2b template list` - 列出所有模板
+  - `e2b template delete` - 删除模板
+
+- [F4.7] SDK API（Template Builder）
+  - `Template().fromBaseImage(image)` - 从基础镜像开始
+  - `template.copy(src, dest)` - 复制文件
+  - `template.runCmd(cmd)` - 执行命令
+  - `template.env(key, value)` - 设置环境变量
+  - `template.build()` - 触发构建
 
 **验收标准**：
-- 模板创建时间 < 5 分钟
-- 使用模板创建沙盒比空白镜像快 50%
+- 模板构建时间 < 5 分钟（标准 Python/Node.js 环境）
+- 使用自定义模板创建沙盒速度提升 80%（无需安装依赖）
+- 100% 兼容 E2B 构建系统工作流
+- 支持增量构建和缓存（Docker layer caching）
+
+**使用示例**：
+```toml
+# e2b.toml
+template_id = "my-python-ai"
+template_name = "python-ai-sandbox"
+dockerfile = "e2b.Dockerfile"
+memory_mb = 2048
+cpu_count = 4
+start_cmd = "python app.py"
+```
+
+```dockerfile
+# e2b.Dockerfile
+FROM python:3.11-slim
+
+# 安装依赖
+RUN pip install --no-cache-dir \
+    openai \
+    langchain \
+    numpy \
+    pandas
+
+# 设置工作目录
+WORKDIR /workspace
+
+# 预加载模型（可选）
+RUN python -c "import nltk; nltk.download('punkt')"
+```
+
+```bash
+# 初始化
+e2b template init --name my-python-ai
+
+# 构建
+e2b template build
+
+# 使用
+sandbox = await Sandbox.create({ template: 'my-python-ai' })
+```
 
 ---
 
-#### F5: 监控和日志
+#### F5: 基础模板管理
+
+**用户故事**：
+> 作为平台运营者，我需要管理预制的基础模板供用户使用。
+
+**功能点**：
+- [F5.1] 列出模板 (`GET /templates`)
+- [F5.2] 删除模板 (`DELETE /templates/{id}`)
+- [F5.3] 模板预热机制（镜像预拉取）
+
+**验收标准**：
+- 模板列表响应 < 200ms
+- 支持分页和搜索
+
+---
+
+#### F6: 监控和日志
 
 **用户故事**：
 > 作为运维工程师，我需要监控沙盒资源使用情况和系统健康状态。
@@ -295,17 +416,17 @@ gVisor E2B 是一个基于 gVisor 容器运行时的**代码执行沙盒平台**
 
 ### 5.3 未来规划 (P2)
 
-#### F6: 多租户隔离
+#### F7: 多租户隔离
 - 团队/组织账户体系
 - 配额管理（每用户沙盒数量限制）
 - 计费系统集成
 
-#### F7: 高级网络功能
+#### F8: 高级网络功能
 - 沙盒间组网
 - 公网 IP 分配
 - VPN/专线接入
 
-#### F8: GPU 支持
+#### F9: GPU 支持
 - NVIDIA GPU 透传
 - AI 模型推理加速
 
