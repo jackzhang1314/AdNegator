@@ -448,6 +448,298 @@ s3://bucket/
 
 ---
 
+### 5.4 MCP Gateway Service (数据平面)
+
+#### 5.4.1 概述
+
+**MCP Gateway** 是一个轻量级的 Sidecar 容器，运行在每个启用 MCP 的沙箱 Pod 中，负责管理 MCP 工具容器的生命周期并路由 MCP 协议请求。
+
+**架构图**:
+```
+┌─────────────────────────────────────────────────────────┐
+│                    E2B Sandbox Pod                       │
+│                                                           │
+│  ┌──────────────────────┐    ┌──────────────────────┐  │
+│  │  Main Container      │    │  MCP Gateway         │  │
+│  │  (User Application)  │    │  Sidecar Container   │  │
+│  │                      │    │                       │  │
+│  │  Port 8080 (app)     │    │  Port 8000 (gateway) │  │
+│  └──────────────────────┘    └──────────┬───────────┘  │
+│                                          │               │
+│  Shared Network Namespace (localhost)   │               │
+│                                          │               │
+│  ┌──────────────┐  ┌──────────────┐    │               │
+│  │ Browserbase  │  │     Exa      │    │               │
+│  │  Container   │  │  Container   │◄───┘               │
+│  │              │  │              │                     │
+│  │ Port 9001    │  │ Port 9002    │                     │
+│  └──────────────┘  └──────────────┘                     │
+└─────────────────────────────────────────────────────────┘
+```
+
+#### 5.4.2 技术选型
+
+**语言**: Go 1.21+
+
+**理由**:
+- 轻量级，内存占用低（< 50MB）
+- 优秀的并发性能（goroutines）
+- 原生 Docker SDK 支持
+- 快速启动时间（< 1s）
+
+**关键依赖**:
+- `github.com/docker/docker/client` - Docker 客户端
+- `net/http` - HTTP 服务器
+- `encoding/json` - JSON 处理
+
+#### 5.4.3 核心职责
+
+**1. MCP 工具容器生命周期管理**
+```go
+type Gateway struct {
+    dockerClient  *client.Client
+    sandboxID     string
+    configs       map[string]*MCPServerConfig
+    containers    map[string]*ContainerInfo
+}
+
+// 启动所有 MCP 工具容器
+func (g *Gateway) Start(ctx context.Context) error {
+    for serverID, config := range g.configs {
+        container, err := g.startMCPContainer(ctx, config)
+        if err != nil {
+            return fmt.Errorf("failed to start %s: %w", serverID, err)
+        }
+        g.containers[serverID] = container
+    }
+    return g.listenHTTP(":8000")
+}
+
+// 启动单个 MCP 工具容器
+func (g *Gateway) startMCPContainer(ctx context.Context, config *MCPServerConfig) error {
+    // 1. 配置环境变量（凭证）
+    envVars := []string{}
+    for key, value := range config.Credentials {
+        envVars = append(envVars, fmt.Sprintf("%s=%v", key, value))
+    }
+
+    // 2. 创建容器（共享网络命名空间）
+    resp, err := g.dockerClient.ContainerCreate(ctx, &container.Config{
+        Image: fmt.Sprintf("%s:%s", config.Image, config.Tag),
+        Env:   envVars,
+    }, &container.HostConfig{
+        NetworkMode: "container:" + g.sandboxID,
+    }, nil, nil, "")
+
+    // 3. 启动容器
+    return g.dockerClient.ContainerStart(ctx, resp.ID, container.StartOptions{})
+}
+```
+
+**2. MCP 请求路由**
+```go
+// HTTP 处理器
+func (g *Gateway) HandleMCPRequest(w http.ResponseWriter, r *http.Request) {
+    // 1. 验证访问令牌
+    token := r.Header.Get("Authorization")
+    if !g.validateToken(token) {
+        http.Error(w, "Unauthorized", http.StatusUnauthorized)
+        return
+    }
+
+    // 2. 解析 MCP 请求
+    var mcpReq MCPRequest
+    json.NewDecoder(r.Body).Decode(&mcpReq)
+
+    // 3. 路由到对应的工具容器
+    serverID := mcpReq.Server // 例如 "browserbase"
+    container := g.containers[serverID]
+
+    // 4. 代理请求到工具容器
+    targetURL := fmt.Sprintf("http://localhost:%d%s", container.Port, r.URL.Path)
+    proxyReq, _ := http.NewRequest(r.Method, targetURL, r.Body)
+    resp, _ := http.DefaultClient.Do(proxyReq)
+
+    // 5. 返回响应
+    io.Copy(w, resp.Body)
+}
+```
+
+**3. Token 认证**
+```go
+type AuthProvider struct {
+    dbClient *sql.DB
+}
+
+func (a *AuthProvider) Validate(token string, sandboxID string) bool {
+    // 查询数据库验证 token
+    var session MCPGatewaySession
+    err := a.dbClient.QueryRow(
+        "SELECT * FROM mcp_gateway_sessions WHERE access_token = $1 AND sandbox_id = $2",
+        token, sandboxID,
+    ).Scan(&session)
+
+    if err != nil || session.Status != "active" {
+        return false
+    }
+
+    // 检查过期时间
+    return time.Now().Before(session.TokenExpiresAt)
+}
+```
+
+**4. 健康检查**
+```go
+// 定期检查工具容器状态
+func (g *Gateway) HealthCheck(ctx context.Context) {
+    ticker := time.NewTicker(10 * time.Second)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-ticker.C:
+            for serverID, containerInfo := range g.containers {
+                inspect, err := g.dockerClient.ContainerInspect(ctx, containerInfo.ContainerID)
+                if err != nil || !inspect.State.Running {
+                    // 容器异常，尝试重启
+                    g.restartContainer(ctx, containerInfo)
+                }
+            }
+        case <-ctx.Done():
+            return
+        }
+    }
+}
+```
+
+#### 5.4.4 数据流
+
+**MCP 请求流程**:
+```
+1. AI Client 发送请求
+   ↓
+2. HTTPS → Sandbox Public URL (https://sandbox-abc.e2b.dev/mcp)
+   ↓
+3. MCP Gateway 验证 Bearer token
+   ↓
+4. 解析请求，提取 server_id (如 "browserbase")
+   ↓
+5. 代理请求到工具容器 (localhost:9001)
+   ↓
+6. 工具容器处理请求，返回响应
+   ↓
+7. Gateway 转发响应到 AI Client
+```
+
+#### 5.4.5 性能指标
+
+| 指标 | 目标 |
+|------|------|
+| Gateway 启动时间 | < 1s |
+| 工具容器启动时间 | < 5s |
+| MCP 请求延迟 (p95) | < 500ms |
+| Gateway 内存占用 | < 50MB |
+| 并发请求处理能力 | 1000+ req/s |
+
+#### 5.4.6 资源配置
+
+```yaml
+# Kubernetes Sidecar 配置
+containers:
+- name: mcp-gateway
+  image: gvisor-e2b/mcp-gateway:latest
+  ports:
+  - containerPort: 8000
+    name: http
+  env:
+  - name: SANDBOX_ID
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.labels['sandbox-id']
+  - name: MCP_CONFIGS
+    valueFrom:
+      secretRef:
+        name: sandbox-mcp-configs
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 250m
+      memory: 256Mi
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: 8000
+    initialDelaySeconds: 5
+    periodSeconds: 10
+  readinessProbe:
+    httpGet:
+      path: /ready
+      port: 8000
+    initialDelaySeconds: 3
+    periodSeconds: 5
+```
+
+#### 5.4.7 部署模式
+
+**Sidecar 注入流程**:
+```
+1. 用户创建沙箱，指定 mcp 参数
+   ↓
+2. API Server 接收请求
+   ↓
+3. Scheduler 生成 Pod YAML
+   ↓
+4. 如果 mcp 参数存在，注入 MCP Gateway sidecar
+   ↓
+5. Kubernetes 创建 Pod
+   ↓
+6. MCP Gateway 启动，读取配置
+   ↓
+7. Gateway 启动所有 MCP 工具容器
+   ↓
+8. 沙箱就绪，返回 MCP Gateway URL
+```
+
+#### 5.4.8 与控制平面的交互
+
+**配置同步**:
+- Gateway 启动时从环境变量读取 MCP 配置
+- 配置由控制平面加密并注入到 Kubernetes Secret
+- Gateway 不直接访问数据库（减少耦合）
+
+**状态上报**:
+- Gateway 定期向控制平面上报工具容器状态
+- 通过 Kubernetes 的 Pod Annotations 更新状态
+- 控制平面轮询 Annotations 同步到数据库
+
+**动态配置**:
+- 用户通过 API 添加/移除 MCP 工具
+- 控制平面更新 Kubernetes Secret
+- Gateway 监听 Secret 变化，热重载配置
+
+#### 5.4.9 安全设计
+
+**网络隔离**:
+- Gateway 和工具容器共享网络命名空间
+- 工具容器之间通过 localhost 通信
+- 外部只能访问 Gateway (8000 端口)
+
+**凭证管理**:
+- 凭证在控制平面加密（AES-256-GCM）
+- 加密后存储到 Kubernetes Secret
+- Gateway 启动时解密（密钥来自 Secret）
+- 工具容器通过环境变量接收凭证
+
+**请求审计**:
+- 所有 MCP 请求记录到日志
+- 包含：timestamp, sandbox_id, server_id, method, status_code
+- 日志通过 Fluentd 收集到中心日志系统
+- 敏感信息（凭证、响应内容）脱敏处理
+
+---
+
 ## 6. 部署架构
 
 ### 6.1 Kubernetes 部署拓扑
