@@ -1,9 +1,19 @@
+# ⚠️ OUTDATED - Pause/Resume Information Incorrect ⚠️
+
+**Critical Error on Line 23**: This plan incorrectly states "E2B 不支持 pause/resume"
+**Fact**: E2B v2.0.1+ supports pause/resume as a Beta feature (Firecracker snapshots)
+**Corrections Applied**: All design documents updated with correct information
+
+See [E2B-PAUSE-RESUME-TRUTH.md](./E2B-PAUSE-RESUME-TRUTH.md) for correct information.
+
+---
+
 # 设计文档更新计划 (Design Document Update Plan)
 
 **文档版本**: v1.0
 **创建日期**: 2025-11-05
 **作者**: Claude
-**状态**: Ready for Review
+**状态**: Ready for Review (Note: Pause/resume info needs correction)
 
 ---
 

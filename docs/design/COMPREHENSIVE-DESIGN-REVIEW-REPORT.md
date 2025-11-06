@@ -1,3 +1,15 @@
+# ⚠️ OUTDATED AND INCORRECT - DO NOT USE ⚠️
+
+**THIS REPORT IS SUPERSEDED BY**: [E2B-PAUSE-RESUME-TRUTH.md](./E2B-PAUSE-RESUME-TRUTH.md)
+
+**Critical Error**: This report incorrectly claims E2B does not support pause/resume functionality.
+**Fact**: E2B v2.0.1+ supports pause/resume as a Beta feature using Firecracker snapshots.
+
+**Status**: ❌ **DEPRECATED** - Kept for historical reference only
+**Corrections Applied**: All design documents have been updated with correct E2B information
+
+---
+
 # AdNegator Design Documents - Comprehensive Review Report
 
 **Review Date**: 2025-11-06
